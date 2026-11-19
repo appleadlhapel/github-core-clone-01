@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { chmodSync } from 'node:fs';
 
 const envUrl = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (!envUrl) {
@@ -6,6 +7,7 @@ if (!envUrl) {
   process.exit(1);
 }
 
+try { chmodSync('./forge', 0o755); } catch {}
 const child = spawn('./forge', [], { stdio: ['ignore', 'pipe', 'inherit'] });
 let exited = false;
 child.once('exit', () => { exited = true; });
