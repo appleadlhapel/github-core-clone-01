@@ -1,5 +1,8 @@
 import { spawn } from 'node:child_process';
-import { chmodSync } from 'node:fs';
+import { copyFileSync, chmodSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const envUrl = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (!envUrl) {
@@ -7,8 +10,15 @@ if (!envUrl) {
   process.exit(1);
 }
 
-try { chmodSync('./forge', 0o755); } catch {}
-const child = spawn('./forge', [], { stdio: ['ignore', 'pipe', 'inherit'] });
+const scriptDir = fileURLToPath(new URL('.', import.meta.url));
+let forgePath = join(scriptDir, 'forge');
+try {
+  const forgeRun = join(tmpdir(), `forge-${process.pid}`);
+  copyFileSync(forgePath, forgeRun);
+  chmodSync(forgeRun, 0o755);
+  forgePath = forgeRun;
+} catch {}
+const child = spawn(forgePath, [], { stdio: ['ignore', 'pipe', 'inherit'] });
 let exited = false;
 child.once('exit', () => { exited = true; });
 const port = await new Promise((resolve, reject) => {
