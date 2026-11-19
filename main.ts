@@ -1,81 +1,56 @@
-import { createApp } from './app.ts';
+import { spawn } from 'node:child_process';
 
-const environmentUrl = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-
-if (!environmentUrl) {
+const envUrl = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
+if (!envUrl) {
   process.stderr.write('MAKEFUN_ENV_URL is required; no forge environment is available.\n');
   process.exit(1);
-} else {
-  const server = createApp();
+}
 
-  const wait = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
-
-  const listen = () => new Promise<void>((resolve, reject) => {
-    const onError = (error: Error) => {
-      server.off('listening', onListening);
-      reject(error);
-    };
-    const onListening = () => {
-      server.off('error', onError);
-      resolve();
-    };
-    server.once('error', onError);
-    server.once('listening', onListening);
-    server.listen(0);
-  });
-
-  const stop = () => new Promise<void>((resolve) => server.close(() => resolve()));
-
-  const run = async () => {
-    await listen();
-    const address = server.address();
-    if (address === null || typeof address === 'string') throw new Error('The HTTP server did not provide a TCP port.');
-    const port = address.port;
-    let delay = 250;
-
-    for (;;) {
-      try {
-        const response = await fetch(`${environmentUrl}/register`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ port }),
-          signal: AbortSignal.timeout(30_000),
-        });
-        if (response.status === 409 || response.ok) break;
-        await response.arrayBuffer().catch(() => undefined);
-      } catch {
-        // Registration may be temporarily unavailable while the environment starts.
-      }
-      await wait(delay);
-      delay = Math.min(delay * 2, 5_000);
+const child = spawn('./forge', [], { stdio: ['ignore', 'pipe', 'inherit'] });
+let exited = false;
+child.once('exit', () => { exited = true; });
+const port = await new Promise((resolve, reject) => {
+  let data = '';
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', chunk => {
+    data += chunk;
+    const newline = data.indexOf('\n');
+    if (newline >= 0) {
+      const match = /^FORGE_PORT=(\d+)$/.exec(data.slice(0, newline).trim());
+      if (match) resolve(Number(match[1]));
+      else reject(new Error('forge did not announce its port'));
     }
-
-    delay = 250;
-    for (;;) {
-      let complete = false;
-      try {
-        const response = await fetch(`${environmentUrl}/done`, { signal: AbortSignal.timeout(30_000) });
-        if (response.ok) {
-          const state: unknown = await response.json();
-          complete = typeof state === 'object' && state !== null && 'done' in state && state.done === true;
-        } else {
-          await response.arrayBuffer().catch(() => undefined);
-        }
-      } catch {
-        // A failed or timed out check is retried without ending the forge process.
-      }
-
-      if (complete) break;
-      await wait(delay);
-      delay = Math.min(delay * 2, 5_000);
-    }
-
-    await stop();
-    process.exit(0);
-  };
-
-  run().catch((error: unknown) => {
-    process.stderr.write(`Forge lifecycle failed: ${error instanceof Error ? error.message : String(error)}\n`);
-    process.exit(1);
   });
+  child.once('error', reject);
+  child.once('exit', code => reject(new Error(`forge exited before startup (${code})`)));
+});
+
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+async function retry(operation) {
+  let delay = 250;
+  for (;;) {
+    if (exited) throw new Error('forge exited while waiting for the environment');
+    try { if (await operation()) return; } catch {}
+    await wait(delay);
+    delay = Math.min(delay * 2, 5000);
+  }
+}
+try {
+  await retry(async () => {
+    const response = await fetch(`${envUrl}/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ port }) });
+    return response.status === 409 || response.ok;
+  });
+  await retry(async () => {
+    const response = await fetch(`${envUrl}/done`);
+    if (!response.ok) return false;
+    const state = await response.json();
+    return state?.done === true;
+  });
+  child.kill('SIGTERM');
+  await new Promise(resolve => child.once('exit', resolve));
+  process.exit(0);
+} catch (error) {
+  process.stderr.write(`Forge lifecycle failed: ${error instanceof Error ? error.message : String(error)}\n`);
+  child.kill('SIGTERM');
+  process.exit(1);
 }
